@@ -184,7 +184,7 @@ test_normalization_permanova(ps_bees_rle)
 test_normalization_permanova(ps_bees_deseq)
 ```
 
-# We select RLE, based on this test!
+## We select RLE, based on this test!
 ```{r}
 saveRDS(ps_bees_rle, "ps_bees_rle.rds")
 ```
@@ -192,8 +192,7 @@ saveRDS(ps_bees_rle, "ps_bees_rle.rds")
 
 
 
-# Machine learning portion: Logistic regression
-# In many cases, machine learning is used to build a generalizable classifier that can be used to make predictions about unseen data. However, realistically in our research, we will use it to find individual bacteria or groups of bacteria that best explain a phenotype. We're going to practice doing that today.
+# Machine learning portion: Logistic regression. In many cases, machine learning is used to build a generalizable classifier that can be used to make predictions about unseen data. However, realistically in our research, we will use it to find individual bacteria or groups of bacteria that best explain a phenotype. We're going to practice doing that today.
 
 
 ### Load in selected data
@@ -278,7 +277,7 @@ makePredictions(model_f, x = x_test, y = y_test$bee_type_F, ps = ps_test, reg = 
 
 # In reality, you'll use something called cross-validation to pick a good value of reg. We're not going to focus on that today though. If you want to build actual predictive machine learning classifiers, I suggest you look into the machinelearningmastery.com resources
 ```
-# Look at which ASVs are most important for this prediction task
+### Look at which ASVs are most important for this prediction task
 ```{r}
 betas <- coef(model_f, s = reg) # get the beta values from the model
 betas <- data.frame(as.matrix(betas)) # casting types to get the data in a form we like
@@ -289,7 +288,7 @@ betas_imp <- betas_imp[rownames(betas_imp) != "(Intercept)", , drop = F] #Interc
 # we see ASVs 5, 42, 25, 6, and 7 are the most interesting in defining whether or not a bee is a forager. These are the ONLY ASVs used to make this very accurate prediction!
 ``` 
 
-# Plot differential abundance of these ASVs, and get their names from the tax table
+### Plot differential abundance of these ASVs, and get their names from the tax table
 ```{r, fig.width = 12}
 library(reshape2)
 library(ggpubr)
@@ -561,3 +560,125 @@ ps_autism <- readRDS("ps_m3_notnorm.rds")
 
 
 
+
+
+# Random forest section : back to bees
+
+### Load in selected data
+```{r}
+library(randomForest)
+ps <- readRDS("ps_bees_rle.rds")
+```
+
+### Set aside testing data
+```{r, fig.height = 6}
+set.seed(1)
+index_train <- createDataPartition(ps@sam_data$bee_type, p = 0.7)[[1]]
+x_train <- ps@otu_table[index_train, ]
+x_test <- ps@otu_table[-index_train, ]
+#split the phyloseq objects into training and testing to make our lives easier later on
+
+ps_train <- phyloseq(otu_table(ps@otu_table[, index_train], taxa_are_rows = TRUE), ps@sam_data[index_train, ])
+ps_test <- phyloseq(otu_table(ps@otu_table[, -index_train], taxa_are_rows = TRUE), ps@sam_data[-index_train, ])
+```
+
+### Find the optimal tree depth (mtry) using cross validation with the caret package
+```{r}
+#Notes:
+#trainControl is basically a controller for the cross-validation process. It will get passed to the train command. The package we used above, glmnet, does cross validation for you. Because glmnet doesn't implement random forests, we'll be using the caret package to handle our cross-validation
+
+#The train function in caret will want the data as a dataframe where one column is singled out at the answers. Our answers will be the "hive_role" column which we're creating here
+set.seed(1)
+data_train = data.frame(x_train)
+data_train$hive_role = ps_train@sam_data$bee_type
+control <- trainControl(method='repeatedcv', 
+                        number=3, 
+                        repeats=3)
+
+tunegrid <- expand.grid(.mtry=c(3:20)) #mtry is the depth of each decision tree. We'll be trying out models where each tree is 3 to 20 splits deep
+rf <- train(hive_role ~., 
+            data= data_train, 
+            method='rf', 
+            metric='Accuracy', 
+            tuneGrid=tunegrid, 
+            trControl=control)
+print(rf)
+
+## Accuracy is measured using the test set assigned at each fold during cross validation. These small sub-test sets are called validation sets, for the sake of unique vocabulary. Similar to how we used cv.glmnet above to find the optimal strength of regularization, checking our error on these validation sets during cross validation allows us to pick a tree depth that will likely work best on outside data. Remember that the cross validation is happening on the training set, so we still have the actual test set to check performance on. 
+
+#In this case, the deeper the trees, the more the model overfits the training data, resulting in lower accuracy on the validation set, which is the number reported.
+```
+### Let's try the model performanceon the held out test set, using the value for mtry (tree depth) chosen during cross validation
+```{r ,fig.height = 3}
+mtry_best = as.numeric(rf$bestTune)
+model = randomForest(x_train, y = as.factor(ps_train@sam_data$bee_type), mtry = mtry_best)
+
+#Performance on test set
+preds = predict(model, x_test)
+print(paste("Accuracy: ", sum(preds == as.factor(ps_test@sam_data$bee_type)) / nsamples(ps_test)))
+
+#Visualize on whole dataset
+ps@sam_data$rf_predictions = predict(model, ps@otu_table)
+ord <- ordinate(ps, method = "PCoA", distance = "bray")
+plot_ordination(ps, ord, 'samples', color = 'bee_type', shape = 'rf_predictions')+
+  theme_bw()+
+  geom_point(size = 3)
+```
+
+### Now we'd like to know which taxa were most important in training the full model (all data). Notice that every time you train a model and take a look at the importance of variables, you get a different graph for the importance of each variable. Run this command multiple times to see this.
+```{r, fig.height = 7, fig.width = 7}
+model = randomForest(ps@otu_table, y = as.factor(ps@sam_data$bee_type), mtry = mtry_best)
+varImpPlot(model, type = 2)
+# Run this chunk multiple times to see how the variable importance changes randomly
+```
+
+### Question: How can we tell which variables are really important?
+
+### A common technique with random forests and other models that rely on randomness is to simply do the training process a number of times and average the results. Here, we'll do it 50 times
+```{r, fig.height = 6}
+imp_list <- list()
+for(i in 1:50){
+  model = randomForest(ps@otu_table, y = as.factor(ps@sam_data$bee_type), mtry = mtry_best)
+  imp_list[i] <- varImp(model)
+}
+
+imp_df <- do.call(rbind.data.frame, imp_list)
+colnames(imp_df) <- colnames(x_train)
+colMeans(imp_df)
+barplot(sort(colMeans(imp_df)), horiz = T, las = 1, xlab = "Mean variable importance")
+#These importance scores should not change much, because they are averages.
+
+#one weakness of random forests is that while they return variable importance, it is difficult (but still possible) to get the directionality of each variable (positively or negatively associated with output variable). This is because random forests allow for large amounts of dependence. A low value for a taxa 2 might mean forager when paired with a high value for taxa 18, but worker when paired with a high value for taxa 21. It's difficult to pull apart those inconsistencies in the model. 
+```
+### Challenge 1: plot the differential abundance of the top 6 most important ASVs across all 3 categories of bee. There are lots of ways to do this! Use plot_taxa function above as inspiration. (Expected 30 min exercise)
+```{r, fig.width = 12}
+
+```
+
+
+
+### Challenge 1 answer
+```{r}
+top6 <- names(sort(colMeans(imp_df), decreasing = T)[1:6])
+seqtab <- data.frame(ps@otu_table)
+seqtab <- seqtab[ , top6]
+seqtab$bee_type <- ps@sam_data$bee_type
+seqtab_m <- melt(seqtab)
+
+# get the full names of the taxa 
+tax_tab <- data.frame(tax_table(ps))
+tax_tab <- tax_tab[seqtab_m$variable, ]
+tax_names <- paste(tax_tab$Family, tax_tab$Genus, tax_tab$Species)
+seqtab_m$variable <- tax_names
+
+seqtab_m$value <- seqtab_m$value + 1 # add 1 for plotting purposes (we will log and log(0) is undefined)
+ggplot(data = seqtab_m, aes(x = bee_type, y = value, fill = bee_type)) + 
+  geom_boxplot()+
+  geom_jitter(width = 0.2)+
+  facet_wrap(~variable, scales = "free")+ # plot each ASV on its on plot, and use independent scales for each y axis
+  theme_bw()+ # I hate the grey background
+  stat_compare_means()+ # add statistics
+  scale_y_log10(expand = c(0, 0.5)) # change the y axis to log scale, and extend it a bit upwards so the stats are not cut off visually
+
+# Note, two ASVs had identical annotations so they are combined in this graph
+```
