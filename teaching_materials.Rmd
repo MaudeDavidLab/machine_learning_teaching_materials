@@ -1,0 +1,563 @@
+---
+title: "teaching_materials_normalization"
+output: html_document
+---
+
+# Load libraries
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 5.5, fig.height = 4)
+library(phyloseq)
+library(ggplot2)
+library(metagenomeSeq)
+library(scales)
+library(DESeq2)
+library(vegan)
+library(caret)
+library(glmnet)
+```
+
+# Plot histogram function definition in base R
+```{r}
+plotHistogram <- function(vector, title = ""){
+  plot(hist(vector, breaks = 20),
+       ylab = "# of ASVs with this # of reads",
+       xlab = "# of reads",
+       main = title)
+}
+```
+
+# Plot histogram function in ggplot
+```{r}
+plotHistogram_ggplot <- function(vector, title = "", xaxis_breaks = 10){
+  df <- data.frame(counts = vector)
+  p <- ggplot(df, aes(y = counts)) +
+    geom_histogram() +
+    ggtitle(title)+
+    coord_flip()+
+    theme_bw()+
+    xlab("# of ASVs with this # of reads")+
+    ylab("# of reads")+
+    theme(text = element_text(size = 8))+
+    scale_y_continuous(breaks = scales::pretty_breaks(n = xaxis_breaks))
+    
+}
+
+```
+
+```{r, fig.height = 4, fig.width = 5.5}
+ps_bees_notnorm <- readRDS("ps_bees_notnorm.rds")
+counts_sample1 <- ps_bees_notnorm@otu_table[1,]
+counts_sample1 <- as.numeric(counts_sample1)
+p_notnorm <- plotHistogram_ggplot(counts_sample1, title = "Read histogram of a single sample: bee dataset")
+p_notnorm
+ggsave("read_histogram_notnorm.png", width = 2, height = 2)
+```
+
+# Total sum scaling - turn count numbers into a percent
+```{r}
+# Transform sample counts is a function that lives in the package phyloseq. It takes in a phyloseq object, and a function to apply to all of the samples in that phyloseq object
+# x will be a count vector that represents 1 sample. Sum(x) is adding all of the counts of that sample vector. Dividing x/sum(x) turns the counts of individual ASVs into percents.
+ps_bees_tss <- transform_sample_counts(ps_bees_notnorm, function(x) x / sum(x))
+counts_sample1 <- ps_bees_tss@otu_table[1,]
+counts_sample1 <- as.numeric(counts_sample1)
+
+p_tss <- plotHistogram_ggplot(counts_sample1, title = "Read histogram of a single sample after TSS: bee dataset")
+p_tss
+ggsave("read_histogram_tss.png", width = 2, height = 2)
+```
+
+
+# Cumulative sum scaling - turn count numbers into almost a percent
+```{r}
+css_norm <- function(ps){
+  metag <- phyloseq_to_metagenomeSeq(ps) # converts the phyloseq object into a metagenomeSeq object (technically called an MRExperiment). Same concept, different format
+  metag_norm <- MRcounts(metag, norm = T) #normalizes by dividing by the 75th quantile
+  ps_css <- phyloseq(otu_table(t(metag_norm), taxa_are_rows = F), sample_data(ps),tax_table(ps), phy_tree(ps))
+  return(ps_css)
+}
+
+ps_bees_css <- css_norm(ps_bees_notnorm)
+counts_sample1 <- ps_bees_css@otu_table[1,]
+counts_sample1 <- as.numeric(counts_sample1)
+
+p_css <- plotHistogram_ggplot(counts_sample1, title = "", xaxis_breaks = 5)
+p_css
+ggsave("read_histogram_css.png", width = 2, height = 2)
+```
+
+# RLE - normalize by a couple of "housekeeping genes"
+```{r}
+rle_norm <- function(ps){
+  seqtab <- data.frame(ps@otu_table)
+  # we're expecting taxa to be on the rows. If they are not, then flip the table
+  if(!taxa_are_rows(ps)){
+    seqtab <- t(seqtab)
+  }
+  print(dim(seqtab))
+  norm_factors <- edgeR::calcNormFactors(seqtab, method = "RLE") #should get 1 number per sample
+  print(norm_factors)
+  seqtab_norm <- sweep(seqtab, 2, norm_factors, '/')
+  
+  ps_norm <- phyloseq(otu_table(seqtab_norm, taxa_are_rows = T), sample_data = sample_data(ps), tax_table = tax_table(ps), phy_tree = phy_tree(ps))
+  
+  # Return in the same shape we found it
+  if(!taxa_are_rows(ps)){
+    ps_norm <- phyloseq(otu_table(t(seqtab_norm), taxa_are_rows = F), sample_data = sample_data(ps), tax_table = tax_table(ps), phy_tree = phy_tree(ps) )
+  }
+  return(ps_norm)
+}
+
+ps_bees_rle <- rle_norm(ps_bees_notnorm)
+counts_sample1 <- ps_bees_rle@otu_table[1,]
+counts_sample1 <- as.numeric(counts_sample1)
+
+p_rle <- plotHistogram_ggplot(counts_sample1, title = "", xaxis_breaks = 5)
+p_rle
+ggsave("read_histogram_rle.png", width = 2, height = 2)
+```
+
+
+# DESeq2 - normalize by a couple of "housekeeping genes", and then add variance stabilization
+```{r}
+
+deseq_norm <- function(ps){
+  #assumes samples are rows
+  dds <- phyloseq_to_deseq2(ps, ~ bee_type) # must include variables that you expect will influence counts
+  dds <- estimateSizeFactors(dds, type = "poscounts")
+  dds <- estimateDispersions(dds)
+  abund <- getVarianceStabilizedData(dds)
+  abund <- abund + abs(min(abund)) #don't allow deseq to return negative counts
+  ps_deSeq <- phyloseq(otu_table(t(abund), taxa_are_rows = F), sample_data(ps), tax_table = tax_table(ps))
+  return(ps_deSeq)
+}
+
+ps_bees_deseq <- deseq_norm(ps_bees_notnorm)
+counts_sample1 <- ps_bees_deseq@otu_table[1,]
+counts_sample1 <- as.numeric(counts_sample1)
+
+p_deseq <- plotHistogram_ggplot(counts_sample1, title = "", xaxis_breaks = 5)
+p_deseq
+ggsave("read_histogram_deseq.png", width = 2, height = 2)
+```
+
+# Which normalization should we use?
+# Pick a method that maximizes a metric you expect to be true about your data
+```{r}
+# In the case of the bees, we expect bees from the same role to be close together. This is a bit odd, because we're then going to predict role from microbiome, so we're cheating a bit in this example. It's because we don't know anything else about the bees besides hive, and we have too many hives (compared with too few bees) to use that variable!
+test_normalization_permanova <- function(ps){
+  d <- phyloseq::distance(ps, method = "bray") # function from phyloseq that calculates the distance between all samples
+  data <- data.frame(ps@otu_table) # turn the count data into a dataframe. Assumes samples are rows
+  data$hive <- ps@sam_data$hive
+  
+  print(adonis2(d ~ hive, data = data))
+  plot_ordination(ps_bees_notnorm, ordination = ordinate(ps, distance = "bray"), color = "hive")+
+    geom_point(size = 4)
+}
+
+
+#R2 is the number we're looking at. We'd like our normalization to maximize R2
+```
+
+
+# Basline
+```{r, fig.width = 5.5, fig.height = 4}
+test_normalization_permanova(ps_bees_notnorm)
+```
+
+# TSS
+```{r, fig.width = 5.5, fig.height = 4}
+test_normalization_permanova(ps_bees_tss)
+```
+
+# CSS
+```{r, fig.width = 5.5, fig.height = 4}
+test_normalization_permanova(ps_bees_css)
+```
+
+# RLE
+```{r, fig.width = 5.5, fig.height = 4}
+test_normalization_permanova(ps_bees_rle)
+```
+
+# DESeq
+```{r, fig.width = 5.5, fig.height = 4}
+test_normalization_permanova(ps_bees_deseq)
+```
+
+# We select RLE, based on this test!
+```{r}
+saveRDS(ps_bees_rle, "ps_bees_rle.rds")
+```
+
+
+
+
+# Machine learning portion: Logistic regression
+# In many cases, machine learning is used to build a generalizable classifier that can be used to make predictions about unseen data. However, realistically in our research, we will use it to find individual bacteria or groups of bacteria that best explain a phenotype. We're going to practice doing that today.
+
+
+### Load in selected data
+```{r}
+ps <- readRDS("ps_bees_rle.rds")
+```
+
+### We'll be predicting whether a bee is a forager, nurse (H) or worker. First, let's make a binary column in our sample_data for each hive role. Each of these columns as TRUE/FALSE values depending on whether that bee fulfills that role. 
+```{r, fig.height = 3, fig.width = 10}
+#add a column to the sample_data that is true/false this bee is a forager, nurse, or worker
+
+ps@sam_data$bee_type_F = ps@sam_data$bee_type == "F"
+ps@sam_data$bee_type_H = ps@sam_data$bee_type == "H"
+ps@sam_data$bee_type_W = ps@sam_data$bee_type == "W"
+```
+
+### Split data into training and testing sets using the caret package
+```{r}
+
+#Notes on code:
+#createDataPartition is a function that will return indices for which samples should be placed into training. 
+#p=.7 means 70% of the samples will be designated as training
+#the function split randomly, keeping the TRUE/FALSE proportions balanced between sets
+
+set.seed(6)
+index_train <- createDataPartition(ps@sam_data$bee_type, p = 0.7)[[1]]
+x_train <- as.matrix(ps@otu_table[index_train, ]) # t() transforms the table into sample by ASV format. as.matrix() casts the table as a matrix type
+x_test <- as.matrix(ps@otu_table[-index_train, ])
+y_train <- ps@sam_data[index_train, c("bee_type_F", "bee_type_H", "bee_type_W" ,"bee_type")]
+y_test <- ps@sam_data[-index_train, c("bee_type_F", "bee_type_H", "bee_type_W","bee_type" )]
+
+ps_train <- phyloseq(otu_table(x_train, taxa_are_rows = FALSE), y_train)
+ps_test <- phyloseq(otu_table(x_test, taxa_are_rows = FALSE), y_test)
+```
+
+
+```{r}
+#Notes:
+# this function is from the glmnet package
+# family = binomial means we'll be using logistic regression 
+# alpha = 1 means lasso (fewer variables); alpha = 0 means ridge regularization (lower coefficients for each variable)
+# we need to pass our input data (x) in as a sample by feature matrix
+# we also need to pass in the actual answers (y)
+# the function will return a trained model
+
+model_f <- glmnet(x = x_train, y = y_train$bee_type_F, family = 'binomial', alpha = 1)
+```
+
+### Declare function we'll reuse to make predictions
+```{r}
+makePredictions <- function(model, x, y, ps, reg, prediction_name){
+  pred_prob <- predict(model, newx = x, s = reg) #s=0 so no regularization
+  predictions <- pred_prob > 0
+  print(paste("Accuracy: ", sum(predictions == y)*100 / length(y), "%")) #check the accuracy on all the data
+  
+  # plot those results
+  ps@sam_data$predicted <- predictions
+  ord <- ordinate(ps, method = "PCoA", distance = 'bray')
+  plot_ordination(ps, ord, 'samples', color = prediction_name, shape = 'predicted') +
+    geom_point(size = 4)+
+    theme_bw()
+}
+
+```
+
+### Get accuracy on the training and testing data
+```{r}
+#Regularize too high (e.g. 1), and the model cannot learn
+reg = 1
+makePredictions(model_f, x = x_train, y = y_train$bee_type_F, ps = ps_train, reg = reg, prediction_name = "bee_type_F")
+makePredictions(model_f, x = x_test, y = y_test$bee_type_F, ps = ps_test, reg = reg, prediction_name = "bee_type_F")
+
+#Regularize too low (e.g. 1), and the model may not generalize to held out data
+reg = 0
+makePredictions(model_f, x = x_train, y = y_train$bee_type_F, ps = ps_train, reg = reg, prediction_name = "bee_type_F")
+makePredictions(model_f, x = x_test, y = y_test$bee_type_F, ps = ps_test, reg = reg, prediction_name = "bee_type_F")
+
+# play with the regularization value until you get something you like!
+reg = 0 # just right (ish). You fill this in
+makePredictions(model_f, x = x_train, y = y_train$bee_type_F, ps = ps_train, reg = reg, prediction_name = "bee_type_F")
+makePredictions(model_f, x = x_test, y = y_test$bee_type_F, ps = ps_test, reg = reg, prediction_name = "bee_type_F")
+
+# In reality, you'll use something called cross-validation to pick a good value of reg. We're not going to focus on that today though. If you want to build actual predictive machine learning classifiers, I suggest you look into the machinelearningmastery.com resources
+```
+# Look at which ASVs are most important for this prediction task
+```{r}
+betas <- coef(model_f, s = reg) # get the beta values from the model
+betas <- data.frame(as.matrix(betas)) # casting types to get the data in a form we like
+betas_imp <- betas[betas$s1 != 0, , drop = F] # get the coefficients that are not 0. The "drop" argument just keeps the data in dataframe form (rather than automatically converting to a vector)
+
+betas_imp <- betas_imp[rownames(betas_imp) != "(Intercept)", , drop = F] #Intercept is meaningless to us
+
+# we see ASVs 5, 42, 25, 6, and 7 are the most interesting in defining whether or not a bee is a forager. These are the ONLY ASVs used to make this very accurate prediction!
+``` 
+
+# Plot differential abundance of these ASVs, and get their names from the tax table
+```{r, fig.width = 12}
+library(reshape2)
+library(ggpubr)
+
+# get the full names of the taxa that are not 0 coeffecients
+tax_tab <- data.frame(tax_table(ps))
+tax_tab <- tax_tab[rownames(betas_imp), ]
+tax_names <- paste(tax_tab$Family, tax_tab$Genus, tax_tab$Species)
+
+
+# now plot
+seqtab <- data.frame(ps@otu_table[ , rownames(betas_imp)])
+colnames(seqtab) <- tax_names
+seqtab$forager <- ps@sam_data$bee_type_F
+seqtab_m <- melt(seqtab)
+ggplot(data = seqtab_m, aes(x = forager, y = value, fill = forager)) + 
+  geom_boxplot()+
+  geom_jitter(width = 0.2)+
+  facet_wrap(~variable, scales = "free")+ # plot each ASV on its on plot, and use independent scales for each y axis
+  theme_bw()+ # I hate the grey background
+  stat_compare_means()+ # add statistics
+  scale_y_log10(expand = c(0, 0.5)) # change the y axis to log scale, and extend it a bit upwards so the stats are not cut off visually
+  
+```
+# Write a function to do all that plotting cleanly in the future
+```{r}
+plot_taxa <- function(ps, model, s){
+  # get important coefficients
+  betas <- coef(model, s = reg) 
+  betas <- data.frame(as.matrix(betas)) 
+  betas_imp <- betas[betas$s1 != 0, , drop = F] 
+  betas_imp <- betas_imp[rownames(betas_imp) %in% taxa_names(ps), , drop=F] # get rid of intercept and diversity if necessary
+  
+  # get the full names of the taxa that are not 0 coeffecients
+  tax_tab <- data.frame(tax_table(ps))
+  tax_tab <- tax_tab[rownames(betas_imp), ]
+  tax_names <- paste(tax_tab$Family, tax_tab$Genus, tax_tab$Species)
+  
+  # now plot
+  seqtab <- data.frame(ps@otu_table[ , rownames(betas_imp)])
+  colnames(seqtab) <- tax_names
+  seqtab$forager <- ps@sam_data$bee_type_F
+  seqtab_m <- melt(seqtab)
+  ggplot(data = seqtab_m, aes(x = forager, y = value, fill = forager)) + 
+    geom_boxplot()+
+    geom_jitter(width = 0.2)+
+    facet_wrap(~variable, scales = "free")+ # plot each ASV on its on plot, and use independent scales for each y axis
+    theme_bw()+ # I hate the grey background
+    stat_compare_means()+ # add statistics
+    scale_y_log10(expand = c(0, 0.5)) # change the y axis to log scale, and extend it a bit upwards so the stats are not cut off visually
+}
+
+```
+
+
+# Let's do all the same analyses for workers instead of foragers
+```{r, fig.width = 12}
+model_w <- glmnet(x = x_train, y = y_train$bee_type_W, family = 'binomial', alpha = 1)
+
+reg = 0.13
+makePredictions(model_w, x = x_train, y = y_train$bee_type_W, ps = ps_train, reg = reg, prediction_name = "bee_type_W")
+makePredictions(model_w, x = x_test, y = y_test$bee_type_W, ps = ps_test, reg = reg, prediction_name = "bee_type_W")
+# In this case, we generalize less well. That means we will have less confidence that the bacteria we identify are globally important to identifying workers. We're missing some information about what it means to be a worker gut microbiome
+
+plot_taxa(ps, model_w, s = 0.13)
+```
+
+
+# You won't be publishing the machine learning results like this, BUT they will give you a good idea of how influential your chosen ASVs actually are. You can have statistical significance in some variables and still not be able to make good predictions, because the variables don't explain enough of the situation. In this case, we can say that these 5 ASVs explain most of what it means to have a forager gut microbiome. The 4 ASVs don't explain enormously well what it means to be a worker gut microbiome. What happen a nurse "H" microbiome?
+
+
+### Challenge 1: Repeat the analysis above for nurse microbiomes
+```{r, fig.width = 10}
+
+
+```
+
+### Challenge 2: Using the code from the first exercise, play with the value of alpha in the model training line. Remember, alpha = 1 means lasso (fewer variables); alpha = 0 means ridge regularization (lower coefficients for each variable). Do some values of alpha give you a better prediction? What are the benefits/drawbacks of each?
+```{r}
+
+```
+
+### Challenge 3: Include alpha diversity as a feature and see how that effects the performance of the classifier.
+
+```{r}
+#1. Use estimate_richness() from the phyloseq package to calculate alpha diversity
+#2. Include these values as a column in your x_train and x_test matrices using cbind()
+#3. Use your function above to see if including diversity changes your predictions
+#4. Extra Challenge: include ONLY diversity in your prediction variables. How does this change your predictions?
+```
+
+
+
+### Challenge 4: Use Principle components as features instead of taxa counts. This is a common technique for trying to cut down on noise in the variables. in this case, we don't see much difference in accuracy because the bee microbiome already contains very few features (ASVs).
+
+```{r}
+#1. Calculate an ordination using the ordinate() function from the phyloseq package. Use Bray Curtis distance
+#2. Once you have the result of ordinate (ord), you can access the principal coordinates using ord$vectors. 
+#3. Break this new ord matrix into training and testing sets using index_train values (from the first couple of cells)
+#4. Use the function you wrote above to make predictions using x_train_pcoa and x_test_pcoa
+```
+
+
+################# ANSWERS ARE BELOW
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Challenge Answer 1: Repeat the analysis above for nurse microbiomes
+```{r, fig.width = 12}
+model_h <- glmnet(x = x_train, y = y_train$bee_type_H, family = 'binomial', alpha = 1)
+
+reg = 0.13
+makePredictions(model_h, x = x_train, y = y_train$bee_type_H, ps = ps_train, reg = reg, prediction_name = "bee_type_H")
+makePredictions(model_h, x = x_test, y = y_test$bee_type_H, ps = ps_test, reg = reg, prediction_name = "bee_type_H")
+# In this case, we generalize less well. That means we will have less confidence that the bacteria we identify are globally important to identifying workers. We're missing some information about what it means to be a worker gut microbiome
+
+plot_taxa(ps, model_h, s = 0.13)
+
+```
+
+### Challenge Answer 2: Using the code from the first exercise, play with the value of alpha in the model training line. Remember, alpha = 1 means lasso (fewer variables); alpha = 0 means ridge regularization (lower coefficients for each variable). Do some values of alpha give you a better prediction? What are the benefits/drawbacks of each?
+```{r, fig.width = 12}
+model_h <- glmnet(x = x_train, y = y_train$bee_type_H, family = 'binomial', alpha = 0.8)
+
+reg = 0.13
+makePredictions(model_h, x = x_train, y = y_train$bee_type_H, ps = ps_train, reg = reg, prediction_name = "bee_type_H")
+makePredictions(model_h, x = x_test, y = y_test$bee_type_H, ps = ps_test, reg = reg, prediction_name = "bee_type_H")
+# In this case, we generalize less well. That means we will have less confidence that the bacteria we identify are globally important to identifying workers. We're missing some information about what it means to be a worker gut microbiome
+
+plot_taxa(ps, model_h, s = 0.13)
+```
+
+
+### Challenge Answer 3: Include alpha diversity as a feature and see how that effects the performance of the classifier.
+
+```{r, fig.width = 14}
+#1. Use estimate_richness() from the phyloseq package to calculate alpha diversity
+#2. Include these values as a column in your x_train and x_test matrices using cbind()
+#3. Use your function above to see if including diversity changes your predictions
+#4. Extra Challenge: include ONLY diversity in your prediction variables. How does this change your predictions?
+
+alpha_div <- estimate_richness(ps, split = TRUE, measures = c("Shannon", "Simpson"))
+alpha_div <- as.matrix(alpha_div)
+#This warning means we should technically go back to the unnormalized, untrimmed data. For the sake of continuing with the exercise, we'll ignore it for now. 
+
+x_train_div <- cbind(x_train, alpha_div[rownames(x_train), ])
+x_test_div <- cbind(x_test, alpha_div[rownames(x_test), ])
+
+# Uncomment to use ONLY diversity as prediction variables. The accuracy will fall spectacularly!
+#x_train_div <- alpha_div[rownames(x_train), , drop = F]
+#x_test_div <- alpha_div[rownames(x_test), , drop = F]
+
+model_w <- glmnet(x = x_train_div, y = y_train$bee_type_W, family = 'binomial', alpha = 1)
+reg = 0.13
+makePredictions(model_w, x = x_train_div, y = y_train$bee_type_W, ps = ps_train, reg = reg, prediction_name = "bee_type_W")
+makePredictions(model_w, x = x_test_div, y = y_test$bee_type_W, ps = ps_test, reg = reg, prediction_name = "bee_type_W")
+plot_taxa(ps, model_w, s = reg)
+
+# Compare to without diversity
+model_w <- glmnet(x = x_train, y = y_train$bee_type_W, family = 'binomial', alpha = 1)
+reg = 0.13
+makePredictions(model_w, x = x_train, y = y_train$bee_type_W, ps = ps_train, reg = reg, prediction_name = "bee_type_W")
+makePredictions(model_w, x = x_test, y = y_test$bee_type_W, ps = ps_test, reg = reg, prediction_name = "bee_type_W")
+
+plot_taxa(ps, model_w, s = reg)
+
+# Seems to make no difference!
+```
+
+
+
+### Challenge Answer 34: Use Principle components as features instead of taxa counts. This is a common technique for trying to cut down on noise in the variables. in this case, we don't see much difference in accuracy because the bee microbiome already contains very few features (ASVs).
+
+```{r}
+#1. Calculate an ordination using the ordinate() function from the phyloseq package. Use Bray Curtis distance
+#2. Once you have the result of ordinate (ord), you can access the principal coordinates using ord$vectors. 
+#3. Break this new ord matrix into training and testing sets using index_train values (from the first couple of cells)
+#4. Use the function you wrote above to make predictions using x_train_pcoa and x_test_pcoa
+
+ps_pcoa <- ps
+ord <- ordinate(ps, method = "PCoA", distance = 'bray')
+x_train_pcoa <- ord$vectors[index_train, ]
+x_test_pcoa <- ord$vectors[-index_train, ]
+y_train_pcoa <- ps_pcoa@sam_data[index_train, ]$bee_type_F
+y_test_pcoa <- ps_pcoa@sam_data[-index_train, ]$bee_type_F
+
+
+model_w <- glmnet(x = x_train_pcoa, y = y_train$bee_type_W, family = 'binomial', alpha = 1)
+reg = 0.13
+makePredictions(model_w, x = x_train_pcoa, y = y_train$bee_type_W, ps = ps_train, reg = reg, prediction_name = "bee_type_W")
+makePredictions(model_w, x = x_test_pcoa, y = y_test$bee_type_W, ps = ps_test, reg = reg, prediction_name = "bee_type_W")
+
+# improved accuracy just a bit
+```
+
+# Fantastic work getting to this point! Next up is the biggest challenge yet, which is taking all the skills and code so far and applying it to a brand new dataset. 
+
+# Load data
+```{r}
+ps_autism <- readRDS("ps_m3_notnorm.rds")
+
+```
+
+# Normalization tests. You should use "Family.group.ID..Biospecimen." as the criteria to normalize to (like we did hive above)
+```{r}
+
+```
+
+# Which type of normalization should we use?: 
+
+
+# Split data into training and testing sets
+```{r}
+
+```
+
+# Try to predict vegetable consumption
+```{r}
+
+```
+
+# plot the taxa relevant to vegetable consumption
+```{r}
+
+```
+
+
+
